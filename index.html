@@ -1233,6 +1233,7 @@ document.querySelectorAll('.navbtn').forEach(btn=>{
    ===================================================================== */
 function getDailySerial(dateISO){
   const count = (DATA.sales || []).filter(s => {
+    if(s.deleted) return false;
     const d = s.saleDate || (s.dateISO ? String(s.dateISO).slice(0,10) : '');
     return d === dateISO;
   }).length;
@@ -1258,6 +1259,31 @@ function generateBillNo(dateISO){
   const dd = String(d).padStart(2,'0');
   const serial = String(getDailySerial(dateISO)).padStart(3,'0');
   return yy + mm + dd + serial + deviceTag();
+}
+// Pure formatter: builds a bill number string from an already-decided serial number.
+function buildBillNo(dateISO, serial, appendTag){
+  const [y,m,d] = dateISO.split('-').map(Number);
+  const yy = String(y % 100).padStart(2,'0');
+  const mm = String(m).padStart(2,'0');
+  const dd = String(d).padStart(2,'0');
+  const ser = String(serial).padStart(3,'0');
+  return yy + mm + dd + ser + (appendTag ? deviceTag() : '');
+}
+// Reserves a guaranteed-unique daily serial number for a bill at the moment it is
+// actually saved. When online, this uses a Firestore atomic transaction (shared
+// counter) so two devices saving at the same instant never get the same number.
+// When offline (or Firebase not ready), it falls back to the local count and a
+// per-device letter tag, so bills still never collide even without internet.
+async function reserveBillSerial(dateISO){
+  if(window.__fbReserveSerial){
+    try{
+      const serial = await window.__fbReserveSerial(dateISO);
+      if(Number.isFinite(serial) && serial>0) return { serial, source:'remote' };
+    }catch(e){
+      console.warn('Bill serial reservation failed, using local fallback:', e);
+    }
+  }
+  return { serial: getDailySerial(dateISO), source:'local' };
 }
 function formatBillNo(billNo){
   const raw = String(billNo ?? '');
@@ -1692,7 +1718,7 @@ function getSaleCostAndDeductPreview(p, qty){
   return Number(p.buyPrice)||0;
 }
 
-function finalizeSale(){
+async function finalizeSale(){
   const validRows = getValidSaleRows();
   const subtotal = validRows.reduce((s,r)=>s+parseNum(r.price)*parseNum(r.qty),0);
   const discount = parseNum(document.getElementById('discountInput').value);
@@ -1719,11 +1745,15 @@ function finalizeSale(){
     };
   });
 
+  const saleDateVal = document.getElementById('saleDateInput').value || todayISODate();
+  const {serial, source} = await reserveBillSerial(saleDateVal);
+  const billNo = buildBillNo(saleDateVal, serial, source==='local');
+
   const sale = {
     id: uid(),
-    billNo: generateBillNo(document.getElementById('saleDateInput').value || todayISODate()),
+    billNo,
     dateISO: new Date().toISOString(),
-    saleDate: document.getElementById('saleDateInput').value || todayISODate(),
+    saleDate: saleDateVal,
     customerName: document.getElementById('custNameInput').value.trim(),
     customerPhone: document.getElementById('custPhoneInput').value.trim(),
     items,
@@ -2835,7 +2865,19 @@ async function fbDeviceSlot(){let slot=localStorage.getItem(FB_SLOT_KEY);if(slot
 const _oldGetDailySerial=getDailySerial;
 getDailySerial=function(dateISO){const slot=Number(localStorage.getItem(FB_SLOT_KEY)||0);if(!slot)return _oldGetDailySerial(dateISO);const mine=(DATA.sales||[]).filter(s=>(s.saleDate||(s.dateISO?String(s.dateISO).slice(0,10):''))===dateISO&&Number(s.deviceSlot)===slot).length;return mine*10+slot;};
 const _oldFinalizeSale=finalizeSale;
-finalizeSale=function(){const before=DATA.sales.length;_oldFinalizeSale();if(DATA.sales.length>before){const s=DATA.sales[DATA.sales.length-1];s.deviceId=fbDeviceId();s.deviceSlot=Number(localStorage.getItem(FB_SLOT_KEY)||0);s.clientCreatedAt=new Date().toISOString();DATA._updatedAt=Date.now();_dokanLocalSaveData();if(FB_USER&&FB_DB)fbQueue(100);}};
+finalizeSale=async function(){const before=DATA.sales.length;await _oldFinalizeSale();if(DATA.sales.length>before){const s=DATA.sales[DATA.sales.length-1];s.deviceId=fbDeviceId();s.deviceSlot=Number(localStorage.getItem(FB_SLOT_KEY)||0);s.clientCreatedAt=new Date().toISOString();DATA._updatedAt=Date.now();_dokanLocalSaveData();if(FB_USER&&FB_DB)fbQueue(100);}};
+window.__fbReserveSerial=async function(dateISO){
+  if(!FB_DB||!FB_USER||!FB_SHOP_ID||FB_ROLE==='none') return null;
+  const ref=FB_DB.collection('shops').doc(FB_SHOP_ID).collection('meta').doc('billCounter');
+  return await FB_DB.runTransaction(async tx=>{
+    const snap=await tx.get(ref);
+    const data=snap.exists?(snap.data()||{}):{};
+    const cur=Number(data[dateISO])||0;
+    const next=cur+1;
+    tx.set(ref,{[dateISO]:next},{merge:true});
+    return next;
+  });
+};
 const _oldSaveData=saveData;saveData=function(){DATA._updatedAt=Date.now();_oldSaveData();if(FB_USER&&FB_DB&&FB_SHOP_ID&&FB_ROLE!=='none')fbQueue(500);};
 async function fbInit(){const cfg=fbCfg();if(!cfg){fbPanel('firebaseSetupPanel');fbGate(true);return;}try{FB_APP=firebase.apps.length?firebase.app():firebase.initializeApp(cfg);FB_AUTH=firebase.auth();FB_DB=firebase.firestore();try{await FB_DB.enablePersistence({synchronizeTabs:true});}catch(e){console.warn('Offline persistence:',e.code||e.message);}fbPanel('firebaseWaitingPanel');FB_AUTH.onAuthStateChanged(async user=>{FB_USER=user;if(!user){FB_ROLE='none';fbStatus('Login প্রয়োজন');fbPanel('firebaseAuthPanel');fbGate(true);return;}if(!FB_SHOP_ID)FB_SHOP_ID=user.uid;FB_ROLE=await fbRole();if(FB_ROLE==='none'){fbSet('firebaseAuthMsg','এই account-এর এই দোকানে access নেই। Owner UID দিন বা Owner-কে আপনার UID দিন।');fbPanel('firebaseAuthPanel');fbGate(true);return;}localStorage.setItem(FB_SHOP_KEY,FB_SHOP_ID);fbUpdateUI();await fbDeviceSlot();fbGate(false);fbStatus('অনলাইন / প্রস্তুত',true);await fbListen();await fbSync();});}catch(e){console.error(e);fbSet('firebaseSetupMsg','Firebase Config/Project তথ্য সঠিক নয়: '+(e.message||e));fbPanel('firebaseSetupPanel');fbGate(true);}}
 document.getElementById('saveFirebaseConfigBtn')?.addEventListener('click',()=>{try{const cfg=JSON.parse(document.getElementById('firebaseConfigInput').value.trim());if(!cfg.apiKey||!cfg.authDomain||!cfg.projectId)throw new Error('apiKey, authDomain ও projectId প্রয়োজন');localStorage.setItem(FB_CFG_KEY,JSON.stringify(cfg));location.reload();}catch(e){fbSet('firebaseSetupMsg',e.message||'Config JSON সঠিক নয়');}});
