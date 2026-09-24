@@ -1291,7 +1291,18 @@ function formatBillNo(billNo){
 }
 function renderBillNo(){
   const dateISO = document.getElementById('saleDateInput').value || todayISODate();
-  document.getElementById('saleBillNoDisplay').value = formatBillNo(generateBillNo(dateISO));
+  const el = document.getElementById('saleBillNoDisplay');
+  if(!el) return;
+  el.value = formatBillNo(generateBillNo(dateISO)); // তাৎক্ষণিক স্থানীয় অনুমান (অফলাইনেও কাজ করে)
+  if(window.__fbPeekSerial){
+    const myToken = (renderBillNo._token = (renderBillNo._token||0)+1);
+    window.__fbPeekSerial(dateISO).then(next=>{
+      if(renderBillNo._token!==myToken) return; // মাঝে আরেকবার renderBillNo() চলে থাকলে পুরনো ফলাফল উপেক্ষা করো
+      if(Number.isFinite(next) && next>0){
+        el.value = formatBillNo(buildBillNo(dateISO, next, false));
+      }
+    }).catch(()=>{});
+  }
 }
 
 function renderSaleRows(){
@@ -2877,6 +2888,15 @@ window.__fbReserveSerial=async function(dateISO){
     tx.set(ref,{[dateISO]:next},{merge:true});
     return next;
   });
+};
+// Read-only peek (no transaction, doesn't reserve/consume a number) — used only to
+// keep the on-screen "next bill" preview looking accurate before saving.
+window.__fbPeekSerial=async function(dateISO){
+  if(!FB_DB||!FB_USER||!FB_SHOP_ID||FB_ROLE==='none') return null;
+  const ref=FB_DB.collection('shops').doc(FB_SHOP_ID).collection('meta').doc('billCounter');
+  const snap=await ref.get();
+  const data=snap.exists?(snap.data()||{}):{};
+  return (Number(data[dateISO])||0)+1;
 };
 const _oldSaveData=saveData;saveData=function(){DATA._updatedAt=Date.now();_oldSaveData();if(FB_USER&&FB_DB&&FB_SHOP_ID&&FB_ROLE!=='none')fbQueue(500);};
 async function fbInit(){const cfg=fbCfg();if(!cfg){fbPanel('firebaseSetupPanel');fbGate(true);return;}try{FB_APP=firebase.apps.length?firebase.app():firebase.initializeApp(cfg);FB_AUTH=firebase.auth();FB_DB=firebase.firestore();try{await FB_DB.enablePersistence({synchronizeTabs:true});}catch(e){console.warn('Offline persistence:',e.code||e.message);}fbPanel('firebaseWaitingPanel');FB_AUTH.onAuthStateChanged(async user=>{FB_USER=user;if(!user){FB_ROLE='none';fbStatus('Login প্রয়োজন');fbPanel('firebaseAuthPanel');fbGate(true);return;}if(!FB_SHOP_ID)FB_SHOP_ID=user.uid;FB_ROLE=await fbRole();if(FB_ROLE==='none'){fbSet('firebaseAuthMsg','এই account-এর এই দোকানে access নেই। Owner UID দিন বা Owner-কে আপনার UID দিন।');fbPanel('firebaseAuthPanel');fbGate(true);return;}localStorage.setItem(FB_SHOP_KEY,FB_SHOP_ID);fbUpdateUI();await fbDeviceSlot();fbGate(false);fbStatus('অনলাইন / প্রস্তুত',true);await fbListen();await fbSync();});}catch(e){console.error(e);fbSet('firebaseSetupMsg','Firebase Config/Project তথ্য সঠিক নয়: '+(e.message||e));fbPanel('firebaseSetupPanel');fbGate(true);}}
